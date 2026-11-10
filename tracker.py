@@ -11,9 +11,9 @@ import os
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
-from .config import Config
-from .models import Candle, Event, Signal, Trade
-from .strategy import cbc_against
+from config import Config
+from models import Candle, Event, Signal, Trade
+from strategy import cbc_against
 
 log = logging.getLogger("tracker")
 

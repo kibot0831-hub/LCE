@@ -1,174 +1,177 @@
-"""Backtest de la estrategia con los MISMOS módulos que el bot (strategy.run).
+"""Backtest con el MISMO motor que el bot en vivo (sin mirar al futuro).
 
-Uso:
-    python backtest.py --symbols BTC-USDT,ETH-USDT,SOL-USDT --days 30
-    python backtest.py --top 20 --days 60 --slip 0.03
+Por defecto prueba la estrategia PULLBACK en 15m (CBC verde -> compra velas rojas,
+CBC rojo -> vende velas verdes). Con STRATEGY=flip prueba la estrategia original.
 
-Descarga velas públicas de BingX (no necesita claves) y respeta tu configuración
-(variables de entorno, igual que el bot). Costes: comisión FEE_PCT por lado + slippage.
+Ejemplos:
+  python backtest.py --symbols BTC-USDT,ETH-USDT,SOL-USDT --days 14
+  python backtest.py --top 30 --days 10 --fee-bps 5
+  python backtest.py --symbols NCCO1OILWTI2USD-USDT --days 20
+  STRATEGY=flip LTF=5m HTF=15m python backtest.py --top 30 --days 14     # estrategia original
+  EXIT_ON_CBC_FLIP=false python backtest.py --top 30 --days 14           # sin salida por flip
 
-Simplificaciones (los resultados reales serán algo peores):
-  * Entrada al cierre de la vela de señal (+ slippage adverso).
-  * Si SL y TP caen en la misma vela, se asume que salta el SL.
-  * No simula parciales/BE/trailing (solo SL, TP y MAX_BARS); sin funding.
-  * Posiciones simultáneas limitadas a MAX_POSITIONS, orden cronológico.
+Las variables de entorno (LTF, HTF, MIN_SCORE, TP_R, MAX_SL_ATR...) se respetan,
+así puedes probar distintas configuraciones antes de usar el bot.
 """
+from __future__ import annotations
+
 import argparse
-import math
+import asyncio
+import logging
 import sys
 import time
+from dataclasses import replace
+from typing import Dict, List
 
-import numpy as np
+import aiohttp
 
-import strategy
-from bingx import BingX, BingXError
-from config import Config
-from main import to_dict
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+from bingx import BingXClient
+from config import Config, load_config
+from models import Candle
+from strategy import MIN_BARS, build_series, cbc_against, evaluate
+from tracker import close_trade_at, new_trade, step_trade
+from universe import build_universe
 
 
-def fetch(bx, sym, interval, bar_ms, bars):
-    """Pagina hacia atrás hasta reunir `bars` velas cerradas."""
-    rows, end = {}, None
-    for _ in range(math.ceil(bars / 1000) + 1):
-        chunk = bx.klines(sym, interval, 1000, end_time=end)
+async def fetch_history(bingx: BingXClient, symbol: str, interval: str, ltf_ms: int, days: float) -> List[Candle]:
+    """Descarga `days` días paginando hacia atrás (máx. 1440 velas por petición)."""
+    now_ms = int(time.time() * 1000)
+    target = now_ms - int(days * 86_400_000) - 500 * ltf_ms  # + calentamiento de indicadores
+    end = now_ms
+    out: Dict[int, Candle] = {}
+    for _ in range(60):
+        chunk = await bingx.klines(symbol, interval, 1440, end_time=end)
         if not chunk:
             break
-        for r in chunk:
-            rows[r[0]] = r
-        first = chunk[0][0]
-        if end is not None and first >= end:
+        for c in chunk:
+            out[c.t] = c
+        first = chunk[0].t
+        if first <= target or first >= end:
             break
         end = first - 1
-        if len(rows) >= bars:
-            break
-    return to_dict([rows[k] for k in sorted(rows)][-bars:], bar_ms)
+    candles = [out[k] for k in sorted(out)]
+    return [c for c in candles if c.t + ltf_ms <= now_ms]  # solo velas cerradas
 
 
-def simulate(cfg, d, signals, fee_pct, slip_pct):
-    """Recorre las señales de un símbolo. Devuelve lista de trades (dicts)."""
-    h, l, t = d["h"], d["l"], d["t"]
-    n, out, free_from = len(t), [], -1
-    for s in sorted(signals, key=lambda x: x.idx):
-        if s.idx <= free_from or s.idx >= n - 1:
+def backtest_symbol(candles: List[Candle], cfg: Config, symbol: str, fee_rate: float,
+                    eval_from_ms: int) -> List[dict]:
+    S = build_series(candles, cfg)
+    ltf_ms = cfg.ltf_sec * 1000
+    trades: List[dict] = []
+    active = None
+
+    def record(tr, ev):
+        fee_r = 2.0 * fee_rate * tr.entry / tr.risk  # comisión ida y vuelta en R
+        trades.append({"symbol": symbol, "side": tr.side, "t": tr.t_signal, "kind": ev.kind,
+                       "r": ev.total_r - fee_r, "gross_r": ev.total_r})
+
+    for i in range(max(MIN_BARS, 3), len(candles)):
+        c = candles[i]
+        if active is not None:
+            final = None
+            for ev in step_trade(active, c, cfg):
+                if ev.final:
+                    final = ev
+            if final is None and cfg.max_trade_hours > 0 and \
+                    (c.t + ltf_ms - active.opened_ms) >= cfg.max_trade_hours * 3_600_000:
+                final = close_trade_at(active, c.c, "TIMEOUT")
+            if final is None and cfg.strategy == "pullback" and cfg.exit_on_cbc_flip \
+                    and cbc_against(active.side, S.cbc[i]):
+                final = close_trade_at(active, c.c, "FLIP")  # el CBC cambió de color en contra
+            if final is not None:
+                record(active, final)
+                active = None
+        if c.t < eval_from_ms:
             continue
-        sgn = 1 if s.side == "LONG" else -1
-        entry = s.entry * (1 + sgn * slip_pct / 100.0)
-        risk_d = (entry - s.sl) * sgn
-        if risk_d <= 0 or (s.tp - entry) * sgn <= 0:
+        sig, _ = evaluate(S, i, cfg, symbol)
+        if sig is None:
             continue
-        exit_px, exit_i, why = None, None, None
-        last = n - 1
-        for j in range(s.idx + 1, n):
-            hit_sl = l[j] <= s.sl if sgn > 0 else h[j] >= s.sl
-            hit_tp = h[j] >= s.tp if sgn > 0 else l[j] <= s.tp
-            if hit_sl:                                    # SL manda si coinciden
-                exit_px, exit_i, why = s.sl * (1 - sgn * slip_pct / 100.0), j, "SL"
-                break
-            if hit_tp:
-                exit_px, exit_i, why = s.tp, j, "TP"
-                break
-            if cfg.max_bars and j - s.idx >= cfg.max_bars:
-                exit_px, exit_i, why = d["c"][j], j, "TIEMPO"
-                break
-        if exit_px is None:
-            continue                                      # sigue abierta al final: se descarta
-        move = (exit_px - entry) * sgn
-        cost = (fee_pct / 100.0) * (entry + exit_px)      # comisión de entrada y salida
-        net = move - cost
-        notional_frac = min(cfg.risk_pct / 100.0 * entry / risk_d, cfg.max_lev)
-        out.append({"t_in": int(t[s.idx]), "t_out": int(t[exit_i]), "side": s.side, "kind": s.kind,
-                    "why": why, "r": net / risk_d, "ret": notional_frac * net / entry})
-        free_from = exit_i
-    return out
-
-
-def portfolio(trades, max_positions):
-    """Filtra por MAX_POSITIONS en orden cronológico y calcula la curva de capital."""
-    kept, open_out = [], []
-    for tr in sorted(trades, key=lambda x: x["t_in"]):
-        open_out = [o for o in open_out if o > tr["t_in"]]
-        if len(open_out) >= max_positions:
-            continue
-        open_out.append(tr["t_out"])
-        kept.append(tr)
-    eq, peak, mdd, curve = 1.0, 1.0, 0.0, []
-    for tr in sorted(kept, key=lambda x: x["t_out"]):
-        eq *= 1.0 + tr["ret"]
-        peak = max(peak, eq)
-        mdd = max(mdd, 1.0 - eq / peak)
-        curve.append(eq)
-    return kept, eq, mdd
-
-
-def stats(trades):
-    if not trades:
-        return None
-    r = np.array([x["r"] for x in trades])
-    gp, gl = r[r > 0].sum(), -r[r < 0].sum()
-    return {"n": len(r), "win": float((r > 0).mean() * 100), "avg_r": float(r.mean()),
-            "pf": float(gp / gl) if gl > 0 else float("inf"), "best": float(r.max()), "worst": float(r.min())}
-
-
-def report(title, trades):
-    s = stats(trades)
-    if not s:
-        print(f"{title}: sin operaciones")
-        return
-    print(f"{title:<14} n={s['n']:<4} acierto={s['win']:5.1f}%  R medio={s['avg_r']:+.3f}  "
-          f"PF={s['pf']:.2f}  mejor={s['best']:+.2f}R peor={s['worst']:+.2f}R")
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--symbols", default="")
-    ap.add_argument("--top", type=int, default=0, help="usar los N contratos con más volumen")
-    ap.add_argument("--days", type=float, default=30)
-    ap.add_argument("--slip", type=float, default=0.03, help="slippage %% por lado (def. 0.03)")
-    a = ap.parse_args()
-    cfg = Config()
-    bx = BingX(demo=False)
-    bars = int(a.days * 86_400_000 / cfg.bar_ms)
-    info = {}
-    for ct in bx.contracts():
-        sy = str(ct.get("symbol", ""))
-        if sy.endswith("-USDT") and not any(sy.upper().startswith(p) for p in cfg.non_crypto_prefixes):
-            info[sy] = int(ct.get("pricePrecision", 4) or 4)
-    if a.symbols:
-        syms = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
-    else:
-        vol = {t.get("symbol"): float(t.get("quoteVolume") or 0) for t in bx.tickers()}
-        syms = sorted((s for s in info), key=lambda s: -vol.get(s, 0))[:a.top or 10]
-    print(f"Backtest {cfg.timeframe} · {a.days:g} días (~{bars} velas) · {len(syms)} símbolos · "
-          f"fee {cfg.fee_pct}%/lado · slip {a.slip}%/lado · riesgo {cfg.risk_pct}% · lev máx {cfg.max_lev}x\n")
-    allt = []
-    for sy in syms:
-        try:
-            d = fetch(bx, sy, cfg.timeframe, cfg.bar_ms, bars)
-            if d is None or len(d["t"]) < 200:
-                print(f"{sy}: pocas velas, salto")
+        if active is not None:
+            if active.side != sig.side or not cfg.exit_on_opposite:
                 continue
-            htf = fetch(bx, sy, cfg.htf, cfg.htf_ms, int(bars * cfg.bar_ms / cfg.htf_ms) + 300)
-            an = strategy.run(cfg, d, htf, mintick=10 ** -info.get(sy, 4))
-        except (BingXError, KeyError, ValueError) as e:
-            print(f"{sy}: error {e}")
-            continue
-        tr = simulate(cfg, d, an.signals, cfg.fee_pct, a.slip)
-        allt += tr
-        s = stats(tr)
-        print(f"{sy:<14} {('n=%d R medio=%+.3f' % (s['n'], s['avg_r'])) if s else 'sin operaciones'}")
-        time.sleep(0.2)
-    kept, eq, mdd = portfolio(allt, cfg.max_positions)
-    print("\n=== RESULTADO (cartera, con MAX_POSITIONS) ===")
-    report("TOTAL", kept)
-    for k in ("BO", "RV", "SW"):
-        report(f"tipo {k}", [x for x in kept if x["kind"] == k])
-    for sd in ("LONG", "SHORT"):
-        report(sd, [x for x in kept if x["side"] == sd])
-    print(f"\nRetorno compuesto: {(eq - 1) * 100:+.1f}%   Drawdown máximo: {mdd * 100:.1f}%")
-    if len(kept) < 100:
-        print("\n⚠ Menos de 100 operaciones: la muestra es demasiado pequeña para sacar conclusiones.")
-    print("⚠ Un backtest favorable NO garantiza resultados futuros. Valida igualmente en signals/demo.")
+            record(active, close_trade_at(active, sig.entry, "OPPOSITE"))
+            active = None
+        active = new_trade(sig, ltf_ms)
+    return trades
+
+
+def summarize(trades: List[dict]) -> None:
+    if not trades:
+        print("\nSin operaciones.")
+        return
+    rs = [t["r"] for t in trades]
+    wins = [r for r in rs if r > 0.05]
+    losses = [r for r in rs if r < -0.05]
+    gp, gl = sum(r for r in rs if r > 0), -sum(r for r in rs if r < 0)
+    eq = peak = dd = 0.0
+    for r in rs:
+        eq += r
+        peak = max(peak, eq)
+        dd = max(dd, peak - eq)
+    print("\n================ RESULTADO (neto de comisiones) ================")
+    print(f"Operaciones:        {len(rs)}   (LONG {sum(t['side']=='LONG' for t in trades)} / SHORT {sum(t['side']=='SHORT' for t in trades)})")
+    print(f"Ganadoras/Perdedoras: {len(wins)} / {len(losses)}   Winrate: {100*len(wins)/len(rs):.1f}%")
+    print(f"Expectativa:        {sum(rs)/len(rs):+.3f} R por operación")
+    print(f"Total:              {sum(rs):+.2f} R")
+    print(f"Profit factor:      {gp/gl:.2f}" if gl > 0 else "Profit factor:      n/a")
+    print(f"Máx. drawdown:      {dd:.2f} R")
+    kinds: Dict[str, int] = {}
+    for t in trades:
+        kinds[t["kind"]] = kinds.get(t["kind"], 0) + 1
+    print("Cierres por tipo:   " + ", ".join(f"{k}={v}" for k, v in sorted(kinds.items())))
+    by_sym: Dict[str, float] = {}
+    for t in trades:
+        by_sym[t["symbol"]] = by_sym.get(t["symbol"], 0.0) + t["r"]
+    best = sorted(by_sym.items(), key=lambda x: x[1], reverse=True)
+    print("Mejores símbolos:   " + ", ".join(f"{s} {r:+.1f}R" for s, r in best[:5]))
+    print("Peores símbolos:    " + ", ".join(f"{s} {r:+.1f}R" for s, r in best[-5:]))
+    print("================================================================")
+    print("Aviso: el pasado no garantiza resultados futuros. Si en una vela se tocan SL y TP,")
+    print("se asume SL primero (conservador). No incluye slippage ni funding.")
+
+
+async def amain(args: argparse.Namespace) -> None:
+    cfg: Config = load_config()
+    cfg = replace(cfg, dry_run=True)
+    logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
+    ltf_ms = cfg.ltf_sec * 1000
+    async with aiohttp.ClientSession(headers={"User-Agent": "bingx-cbc-bot/2.0"}) as session:
+        bingx = BingXClient(session, cfg.requests_per_second)
+        if args.symbols:
+            symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        else:
+            uni = build_universe(await bingx.contracts(), await bingx.tickers(), cfg)
+            symbols = list(uni)[: args.top]
+        print(f"Backtest {len(symbols)} símbolos · {args.days} días · estrategia {cfg.strategy} · "
+              f"LTF {cfg.ltf} / HTF {cfg.htf} · MIN_SCORE {cfg.min_score} · comisión {args.fee_bps} bps/lado")
+        eval_from = int(time.time() * 1000) - int(args.days * 86_400_000)
+        all_trades: List[dict] = []
+        for n, sym in enumerate(symbols, 1):
+            try:
+                candles = await fetch_history(bingx, sym, cfg.ltf, ltf_ms, args.days)
+            except Exception as e:
+                print(f"[{n}/{len(symbols)}] {sym}: error {e}")
+                continue
+            if len(candles) < MIN_BARS + 50:
+                print(f"[{n}/{len(symbols)}] {sym}: pocas velas ({len(candles)})")
+                continue
+            tr = backtest_symbol(candles, cfg, sym, args.fee_bps / 10_000.0, eval_from)
+            all_trades.extend(tr)
+            print(f"[{n}/{len(symbols)}] {sym}: {len(candles)} velas, {len(tr)} operaciones, {sum(t['r'] for t in tr):+.1f}R")
+    summarize(all_trades)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    ap = argparse.ArgumentParser(description="Backtest de la estrategia CBC en BingX")
+    ap.add_argument("--symbols", default="", help="lista separada por comas, p.ej. BTC-USDT,ETH-USDT")
+    ap.add_argument("--top", type=int, default=20, help="si no hay --symbols: top N por volumen")
+    ap.add_argument("--days", type=float, default=14.0)
+    ap.add_argument("--fee-bps", type=float, default=5.0, help="comisión por lado en puntos básicos (5 = 0.05%)")
+    asyncio.run(amain(ap.parse_args()))

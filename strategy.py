@@ -5,10 +5,10 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .config import MAX_SCORE, Config
-from .indicators import (NAN, atr_wilder, bucketize, cbc_states, ema, is_nan,
+from config import MAX_SCORE, Config
+from indicators import (NAN, atr_wilder, bucketize, cbc_states, ema, is_nan,
                          rel_volume, vwap_daily)
-from .models import Candle, Signal
+from models import Candle, Signal
 
 DAY_MS = 86_400_000
 MIN_BARS = 250  # mínimo de velas cerradas para evaluar (EMA200 / HTF estables)

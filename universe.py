@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from .config import Config
-from .models import SymbolMeta
+from config import Config
+from models import SymbolMeta
 
 
 def _int_or_none(x: Any):

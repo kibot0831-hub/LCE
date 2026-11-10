@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from .models import Candle
+from models import Candle
 
 log = logging.getLogger("bingx")
 

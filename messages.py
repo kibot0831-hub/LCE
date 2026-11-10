@@ -6,8 +6,8 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from .config import Config
-from .models import Event, Signal, SymbolMeta, Trade
+from config import Config
+from models import Event, Signal, SymbolMeta, Trade
 
 
 def esc(x) -> str:

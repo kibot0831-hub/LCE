@@ -1,6 +1,9 @@
+.env
 __pycache__/
 *.pyc
-.env
-state/
-.pytest_cache/
 .venv/
+venv/
+state.json
+state.json.tmp
+.idea/
+.vscode/

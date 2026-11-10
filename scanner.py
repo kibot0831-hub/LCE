@@ -7,14 +7,14 @@ import time
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
-from .bingx import BingXClient
-from .config import Config
-from .messages import format_event, format_signal
-from .models import Candle, Signal, SymbolMeta
-from .strategy import MIN_BARS, build_series, evaluate
-from .telegram import Telegram
-from .tracker import Tracker
-from .universe import build_universe
+from bingx import BingXClient
+from config import Config
+from messages import format_event, format_signal
+from models import Candle, Signal, SymbolMeta
+from strategy import MIN_BARS, build_series, evaluate
+from telegram import Telegram
+from tracker import Tracker
+from universe import build_universe
 
 log = logging.getLogger("scanner")
 
